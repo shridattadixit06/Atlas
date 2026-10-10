@@ -1,4 +1,6 @@
 
+#define _POSIX_C_SOURCE 200809L
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6,6 +8,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <dirent.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -46,7 +49,8 @@ static int recv_exact(int fd, void *data, size_t length)
     size_t received = 0;
 
     while (received < length) {
-        ssize_t n = recv(fd, p + received, length - received, 0);
+        ssize_t n = recv(fd, p + received,
+                         length - received, 0);
 
         if (n < 0) {
             if (errno == EINTR)
@@ -63,7 +67,6 @@ static int recv_exact(int fd, void *data, size_t length)
     return 0;
 }
 
-/* Read a newline-terminated header, one byte at a time. */
 static int recv_header(int fd, char *header, size_t capacity)
 {
     size_t used = 0;
@@ -94,7 +97,9 @@ static int recv_header(int fd, char *header, size_t capacity)
 
 static int valid_filename(const char *name)
 {
-    if (*name == '\0' || strlen(name) > 200)
+    size_t len = strlen(name);
+
+    if (len == 0 || len > 200)
         return 0;
 
     for (const char *p = name; *p; p++) {
@@ -105,11 +110,8 @@ static int valid_filename(const char *name)
             return 0;
     }
 
-    if (strcmp(name, ".") == 0 ||
-        strcmp(name, "..") == 0)
-        return 0;
-
-    return 1;
+    return strcmp(name, ".") != 0 &&
+           strcmp(name, "..") != 0;
 }
 
 static void reply_error(int fd, const char *message)
@@ -119,157 +121,278 @@ static void reply_error(int fd, const char *message)
                      "ERR %s\n", message);
 
     if (n > 0 && (size_t)n < sizeof(response))
-        send_all(fd, response, (size_t)n);
+        (void)send_all(fd, response, (size_t)n);
+}
+
+static int write_all(int fd, const void *data, size_t length)
+{
+    const char *p = data;
+    size_t written = 0;
+
+    while (written < length) {
+        ssize_t n = write(fd, p + written, length - written);
+
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+
+        if (n == 0)
+            return -1;
+
+        written += (size_t)n;
+    }
+
+    return 0;
+}
+
+static int make_path(char *path, size_t capacity,
+                     const char *filename)
+{
+    int n = snprintf(path, capacity, "%s%s",
+                     STORAGE_DIR, filename);
+
+    return n >= 0 && (size_t)n < capacity ? 0 : -1;
+}
+
+/* LIST: return stored regular filenames, followed by END. */
+static void handle_list(int client_fd)
+{
+    DIR *dir = opendir(STORAGE_DIR);
+
+    if (dir == NULL) {
+        reply_error(client_fd, "cannot open storage directory");
+        return;
+    }
+
+    struct dirent *entry;
+    int failed = 0;
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.')
+            continue;
+
+        if (!valid_filename(entry->d_name))
+            continue;
+
+        char path[sizeof(STORAGE_DIR) + 201];
+        struct stat st;
+
+        if (make_path(path, sizeof(path), entry->d_name) < 0)
+            continue;
+
+        if (lstat(path, &st) < 0 || !S_ISREG(st.st_mode))
+            continue;
+
+        if (send_all(client_fd, entry->d_name,
+                     strlen(entry->d_name)) < 0 ||
+            send_all(client_fd, "\n", 1) < 0) {
+            failed = 1;
+            break;
+        }
+    }
+
+    closedir(dir);
+
+    if (!failed)
+        (void)send_all(client_fd, "END\n", 4);
+}
+
+static void handle_read(int client_fd, const char *filename)
+{
+    char path[sizeof(STORAGE_DIR) + 201];
+    char buffer[BUFFER_SIZE];
+
+    if (!valid_filename(filename) ||
+        make_path(path, sizeof(path), filename) < 0) {
+        reply_error(client_fd, "invalid filename");
+        return;
+    }
+
+    int file_fd = open(path, O_RDONLY);
+
+    if (file_fd < 0) {
+        reply_error(client_fd, "file not found");
+        return;
+    }
+
+    struct stat st;
+
+    if (fstat(file_fd, &st) < 0 ||
+        !S_ISREG(st.st_mode) ||
+        st.st_size < 0 ||
+        (uintmax_t)st.st_size > MAX_FILE_SIZE) {
+        close(file_fd);
+        reply_error(client_fd, "invalid or oversized file");
+        return;
+    }
+
+    size_t length = (size_t)st.st_size;
+    char response[64];
+
+    int n = snprintf(response, sizeof(response),
+                     "OK %zu\n", length);
+
+    if (n < 0 || (size_t)n >= sizeof(response) ||
+        send_all(client_fd, response, (size_t)n) < 0) {
+        close(file_fd);
+        return;
+    }
+
+    size_t remaining = length;
+
+    while (remaining > 0) {
+        size_t wanted = remaining < sizeof(buffer)
+                      ? remaining : sizeof(buffer);
+
+        ssize_t r = read(file_fd, buffer, wanted);
+
+        if (r < 0) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+
+        if (r == 0)
+            break;
+
+        if (send_all(client_fd, buffer, (size_t)r) < 0)
+            break;
+
+        remaining -= (size_t)r;
+    }
+
+    close(file_fd);
+}
+
+static void handle_write(int client_fd, const char *filename,
+                         size_t length)
+{
+    char path[sizeof(STORAGE_DIR) + 201];
+    char temp_path[sizeof(STORAGE_DIR) + 64];
+    char buffer[BUFFER_SIZE];
+
+    if (!valid_filename(filename) ||
+        make_path(path, sizeof(path), filename) < 0) {
+        reply_error(client_fd, "invalid filename");
+        return;
+    }
+
+    if (length > MAX_FILE_SIZE) {
+        reply_error(client_fd, "file too large");
+        return;
+    }
+
+    int n = snprintf(temp_path, sizeof(temp_path),
+                     "%s.atlas-tmp-XXXXXX", STORAGE_DIR);
+
+    if (n < 0 || (size_t)n >= sizeof(temp_path)) {
+        reply_error(client_fd, "temporary path too long");
+        return;
+    }
+
+    int file_fd = mkstemp(temp_path);
+
+    if (file_fd < 0) {
+        reply_error(client_fd, "cannot create temporary file");
+        return;
+    }
+
+    size_t remaining = length;
+    int failed = 0;
+
+    while (remaining > 0) {
+        size_t chunk = remaining < sizeof(buffer)
+                     ? remaining : sizeof(buffer);
+
+        if (recv_exact(client_fd, buffer, chunk) < 0 ||
+            write_all(file_fd, buffer, chunk) < 0) {
+            failed = 1;
+            break;
+        }
+
+        remaining -= chunk;
+    }
+
+    if (!failed && fsync(file_fd) < 0)
+        failed = 1;
+
+    if (close(file_fd) < 0)
+        failed = 1;
+
+    if (failed) {
+        unlink(temp_path);
+        reply_error(client_fd, "write failed or incomplete");
+        return;
+    }
+
+    if (rename(temp_path, path) < 0) {
+        unlink(temp_path);
+        reply_error(client_fd, "cannot commit file");
+        return;
+    }
+
+    int dir_fd = open(STORAGE_DIR, O_RDONLY | O_DIRECTORY);
+
+    if (dir_fd < 0) {
+        reply_error(client_fd,
+                    "file committed; directory sync failed");
+        return;
+    }
+
+    if (fsync(dir_fd) < 0) {
+        close(dir_fd);
+        reply_error(client_fd,
+                    "file committed; directory sync failed");
+        return;
+    }
+
+    close(dir_fd);
+    (void)send_all(client_fd, "OK\n", 3);
 }
 
 static void handle_client(int client_fd)
 {
     char header[HEADER_SIZE];
     char filename[201];
-    char path[sizeof(STORAGE_DIR) + sizeof(filename)];
-    char buffer[BUFFER_SIZE];
-
-    if (recv_header(client_fd, header, sizeof(header)) < 0) {
-        reply_error(client_fd, "invalid header");
-        return;
-    }
-
+    char extra;
     size_t length;
     int fields;
 
+    if (recv_header(client_fd, header, sizeof(header)) < 0) {
+        reply_error(client_fd, "invalid or incomplete header");
+        return;
+    }
+
+    if (strcmp(header, "LIST") == 0) {
+        handle_list(client_fd);
+        return;
+    }
+
     if (strncmp(header, "READ ", 5) == 0) {
-        fields = sscanf(header + 5, "%200s", filename);
+        fields = sscanf(header + 5, "%200s %c",
+                        filename, &extra);
 
-        if (fields != 1 || !valid_filename(filename)) {
-            reply_error(client_fd, "invalid filename");
+        if (fields != 1) {
+            reply_error(client_fd, "invalid READ header");
             return;
         }
 
-        snprintf(path, sizeof(path), "%s%s",
-                 STORAGE_DIR, filename);
-
-        int file_fd = open(path, O_RDONLY);
-        if (file_fd < 0) {
-            reply_error(client_fd, "file not found");
-            return;
-        }
-
-        struct stat st;
-        if (fstat(file_fd, &st) < 0 || !S_ISREG(st.st_mode) ||
-            st.st_size < 0 ||
-            (uintmax_t)st.st_size > MAX_FILE_SIZE) {
-            close(file_fd);
-            reply_error(client_fd, "invalid or oversized file");
-            return;
-        }
-
-        length = (size_t)st.st_size;
-
-        char response[64];
-        int n = snprintf(response, sizeof(response),
-                         "OK %zu\n", length);
-
-        if (n < 0 || (size_t)n >= sizeof(response) ||
-            send_all(client_fd, response, (size_t)n) < 0) {
-            close(file_fd);
-            return;
-        }
-
-        for (;;) {
-            ssize_t r = read(file_fd, buffer, sizeof(buffer));
-
-            if (r < 0) {
-                if (errno == EINTR)
-                    continue;
-                break;
-            }
-
-            if (r == 0)
-                break;
-
-            if (send_all(client_fd, buffer, (size_t)r) < 0)
-                break;
-        }
-
-        close(file_fd);
+        handle_read(client_fd, filename);
         return;
     }
 
     if (strncmp(header, "WRITE ", 6) == 0) {
-        char extra;
         fields = sscanf(header + 6, "%200s %zu %c",
                         filename, &length, &extra);
 
-        if (fields != 2 || !valid_filename(filename)) {
+        if (fields != 2) {
             reply_error(client_fd, "invalid WRITE header");
             return;
         }
 
-        if (length > MAX_FILE_SIZE) {
-            reply_error(client_fd, "file too large");
-            return;
-        }
-
-        snprintf(path, sizeof(path), "%s%s",
-                 STORAGE_DIR, filename);
-
-        /*
-         * O_NOFOLLOW prevents opening a symbolic link as the
-         * destination on systems that support this flag.
-         */
-        int flags = O_WRONLY | O_CREAT | O_TRUNC;
-#ifdef O_NOFOLLOW
-        flags |= O_NOFOLLOW;
-#endif
-
-        int file_fd = open(path, flags, 0644);
-        if (file_fd < 0) {
-            reply_error(client_fd, "cannot open destination");
-            return;
-        }
-
-        size_t remaining = length;
-        while (remaining > 0) {
-            size_t chunk = remaining < sizeof(buffer)
-                         ? remaining : sizeof(buffer);
-
-            if (recv_exact(client_fd, buffer, chunk) < 0) {
-                close(file_fd);
-                reply_error(client_fd, "incomplete file data");
-                return;
-            }
-
-            size_t written = 0;
-            while (written < chunk) {
-                ssize_t w = write(file_fd, buffer + written,
-                                  chunk - written);
-
-                if (w < 0) {
-                    if (errno == EINTR)
-                        continue;
-                    close(file_fd);
-                    reply_error(client_fd, "write failed");
-                    return;
-                }
-
-                if (w == 0) {
-                    close(file_fd);
-                    reply_error(client_fd, "write failed");
-                    return;
-                }
-
-                written += (size_t)w;
-            }
-
-            remaining -= chunk;
-        }
-
-        if (close(file_fd) < 0) {
-            reply_error(client_fd, "close failed");
-            return;
-        }
-
-        send_all(client_fd, "OK\n", 3);
+        handle_write(client_fd, filename, length);
         return;
     }
 
@@ -284,12 +407,14 @@ int main(void)
     }
 
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+
     if (server_fd < 0) {
         perror("socket");
         return 1;
     }
 
     int opt = 1;
+
     if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR,
                    &opt, sizeof(opt)) < 0) {
         perror("setsockopt");
@@ -323,6 +448,7 @@ int main(void)
         if (client_fd < 0) {
             if (errno == EINTR)
                 continue;
+
             perror("accept");
             continue;
         }
@@ -330,4 +456,7 @@ int main(void)
         handle_client(client_fd);
         close(client_fd);
     }
+
+    close(server_fd);
+    return 0;
 }
