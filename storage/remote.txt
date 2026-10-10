@@ -1,1 +1,1 @@
-Hello from the Atlas client!
+Atlas storage engine test
